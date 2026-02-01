@@ -12,66 +12,113 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.header import Header
 import feedparser
+import re
 import time
 
+# 请求头，避免被部分站点拒绝
+REQUEST_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+}
+
 def fetch_news_from_rss():
-    """从RSS源抓取财经新闻"""
+    """从RSS源抓取财经新闻（财经源直接取最新条目，不依赖关键词过滤）"""
     news_list = []
     
-    # 财经新闻RSS源列表
+    # 财经新闻RSS源列表（多源保证有内容）
     rss_sources = [
-        {
-            'url': 'https://feed.finance.sina.com.cn/realstock/newsuniverse_sh.xml',
-            'source': '新浪财经-上海'
-        },
-        {
-            'url': 'https://feed.finance.sina.com.cn/realstock/newsuniverse_sz.xml',
-            'source': '新浪财经-深圳'
-        },
-        {
-            'url': 'https://www.eastmoney.com/rss/news.html',
-            'source': '东方财富'
-        }
+        {'url': 'https://feed.finance.sina.com.cn/realstock/newsuniverse_sh.xml', 'source': '新浪财经'},
+        {'url': 'https://feed.finance.sina.com.cn/realstock/newsuniverse_sz.xml', 'source': '新浪财经'},
+        {'url': 'https://www.eastmoney.com/rss/news.html', 'source': '东方财富'},
+        {'url': 'https://rss.sina.com.cn/finance/stock.xml', 'source': '新浪股票'},
     ]
     
-    # 关键词过滤（重点关注）
+    # 关键词用于优先展示（不满足也保留，保证有内容）
     keywords = ['美联储', '美国总统', '央行', '利率', '通胀', '股市', '汇率', '经济', 
-                '财政', '政策', 'GDP', '就业', 'CPI', 'PPI', '加息', '降息', '量化宽松']
+                '财政', '政策', 'GDP', '就业', 'CPI', 'PPI', '加息', '降息', '量化宽松', 'A股', '港股', '美股']
     
     for rss_info in rss_sources:
         try:
-            feed = feedparser.parse(rss_info['url'])
+            # 用 requests 拉取，带 User-Agent，再交给 feedparser 解析
+            resp = requests.get(rss_info['url'], headers=REQUEST_HEADERS, timeout=15)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or 'utf-8'
+            feed = feedparser.parse(resp.content)
+            
+            if not feed.entries:
+                continue
+                
             current_time = datetime.now()
+            taken = 0
+            max_per_source = 12
             
             for entry in feed.entries:
-                # 检查发布时间（过去24小时）
+                if taken >= max_per_source:
+                    break
+                title = entry.get('title', '').strip()
+                if not title:
+                    continue
                 try:
-                    pub_time = datetime(*entry.published_parsed[:6])
-                    time_diff = current_time - pub_time
-                    
-                    if time_diff > timedelta(hours=24):
-                        continue
-                except:
-                    pass  # 如果无法解析时间，也包含这条新闻
-                
-                # 检查是否包含关键词
-                title = entry.get('title', '')
-                summary = entry.get('summary', '')
-                content = (title + ' ' + summary).lower()
-                
-                if any(keyword in content for keyword in keywords):
-                    news_list.append({
-                        'title': title,
-                        'description': summary[:200] if summary else '',
-                        'url': entry.get('link', ''),
-                        'source': rss_info['source'],
-                        'publishedAt': entry.get('published', '')
-                    })
+                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                        pub_time = datetime(*entry.published_parsed[:6])
+                        if current_time - pub_time > timedelta(hours=48):
+                            continue  # 超过48小时的不要，放宽到48h
+                except Exception:
+                    pass
+                summary = entry.get('summary', '') or entry.get('description', '')
+                if summary and hasattr(summary, 'replace'):
+                    summary = re.sub(r'<[^>]+>', '', summary)
+                else:
+                    summary = ''
+                content = (title + ' ' + summary)
+                is_highlight = any(kw in content for kw in keywords)
+                news_list.append({
+                    'title': title,
+                    'description': (summary[:200] if summary else ''),
+                    'url': entry.get('link', ''),
+                    'source': rss_info['source'],
+                    'publishedAt': entry.get('published', ''),
+                    'highlight': is_highlight,
+                })
+                taken += 1
         except Exception as e:
-            print(f"抓取 {rss_info['source']} 失败: {e}")
+            print(f"抓取 {rss_info.get('source', rss_info['url'])} 失败: {e}")
             continue
     
+    # 若一条都没有，做兜底：不限制时间，从第一个能用的源取最新几条
+    if not news_list:
+        for rss_info in rss_sources:
+            try:
+                resp = requests.get(rss_info['url'], headers=REQUEST_HEADERS, timeout=15)
+                resp.raise_for_status()
+                resp.encoding = resp.apparent_encoding or 'utf-8'
+                feed = feedparser.parse(resp.content)
+                for entry in (feed.entries or [])[:10]:
+                    title = entry.get('title', '').strip()
+                    if not title:
+                        continue
+                    summary = entry.get('summary', '') or entry.get('description', '')
+                    if summary and hasattr(summary, 'replace'):
+                        summary = re.sub(r'<[^>]+>', '', summary)
+                    else:
+                        summary = ''
+                    news_list.append({
+                        'title': title,
+                        'description': (summary[:200] if summary else ''),
+                        'url': entry.get('link', ''),
+                        'source': rss_info['source'],
+                        'publishedAt': entry.get('published', ''),
+                        'highlight': False,
+                    })
+                if news_list:
+                    break
+            except Exception:
+                continue
+    
+    # 优先展示含关键词的
+    news_list.sort(key=lambda x: (not x.get('highlight', False), x.get('publishedAt', '')), reverse=False)
     return news_list
 
 def fetch_news_from_api():
@@ -192,7 +239,7 @@ def send_via_serverchan(content):
         return False
 
 def send_email(content, recipient_email):
-    """发送邮件"""
+    """发送邮件（QQ邮箱优先使用465端口SSL，失败则尝试587 TLS）"""
     sender_email = os.getenv('EMAIL_SENDER', '')
     email_password = os.getenv('EMAIL_PASSWORD', '')
     smtp_server = os.getenv('SMTP_SERVER', 'smtp.qq.com')
@@ -205,23 +252,36 @@ def send_email(content, recipient_email):
     if not recipient_email:
         recipient_email = sender_email  # 默认发送给自己
     
+    subject = f"财经早报 - {datetime.now().strftime('%Y年%m月%d日')}"
+    html_content = content.replace('\n', '<br>')
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = recipient_email
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+    
+    # 先尝试 465 端口 SSL（QQ邮箱更稳定）
+    if smtp_server == 'smtp.qq.com':
+        try:
+            server = smtplib.SMTP_SSL(smtp_server, 465, timeout=15)
+            server.login(sender_email, email_password)
+            server.sendmail(sender_email, [recipient_email], msg.as_string())
+            server.quit()
+            print("✅ 邮件发送成功（465 SSL）")
+            return True
+        except Exception as e465:
+            print(f"465 SSL 失败，尝试 587 TLS: {e465}")
+    
+    # 587 TLS 或 其他邮箱
     try:
-        msg = MIMEMultipart()
-        msg['From'] = sender_email
-        msg['To'] = recipient_email
-        msg['Subject'] = f"📊 财经早报 - {datetime.now().strftime('%Y年%m月%d日')}"
-        
-        # 将内容转换为HTML格式
-        html_content = content.replace('\n', '<br>')
-        msg.attach(MIMEText(html_content, 'html', 'utf-8'))
-        
-        server = smtplib.SMTP(smtp_server, smtp_port)
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+        server.ehlo()
         server.starttls()
+        server.ehlo()
         server.login(sender_email, email_password)
-        server.send_message(msg)
+        server.sendmail(sender_email, [recipient_email], msg.as_string())
         server.quit()
-        
-        print("✅ 邮件发送成功")
+        print("✅ 邮件发送成功（587 TLS）")
         return True
     except Exception as e:
         print(f"❌ 邮件发送失败: {e}")
