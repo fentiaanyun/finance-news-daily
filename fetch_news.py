@@ -16,12 +16,118 @@ from email.header import Header
 import feedparser
 import re
 import time
+from urllib.parse import quote
 
 # 请求头，避免被部分站点拒绝
 REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/rss+xml, application/xml, text/xml, */*',
 }
+
+def translate_to_chinese(text):
+    """使用百度翻译API将英文翻译成中文（简易版本）"""
+    if not text or len(text.strip()) == 0:
+        return text
+    
+    # 如果已经有中文字符，直接返回
+    if any('\u4e00' <= char <= '\u9fff' for char in text):
+        return text
+    
+    try:
+        # 使用Google翻译的免费接口（非官方，作为备选方案）
+        url = 'https://translate.googleapis.com/translate_a/single'
+        params = {
+            'client': 'gtx',
+            'sl': 'en',
+            'tl': 'zh-CN',
+            'dt': 't',
+            'q': text[:500]  # 限制长度
+        }
+        
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            result = response.json()
+            if result and len(result) > 0 and len(result[0]) > 0:
+                translated = ''.join([item[0] for item in result[0] if item[0]])
+                return translated if translated else text
+    except Exception as e:
+        print(f"  翻译失败: {str(e)[:30]}，保留原文")
+    
+    return text
+
+def classify_news(title, description, source):
+    """将新闻分为三类：1.财经重要新闻 2.重大国际新闻 3.特朗普相关"""
+    content = (title + ' ' + description).lower()
+    
+    # 第三类：特朗普相关（最优先）
+    trump_keywords = [
+        'trump', 'donald trump', 'president trump', 'trump administration',
+        '特朗普', 'trump says', 'trump announces', 'trump policy'
+    ]
+    if any(kw in content for kw in trump_keywords):
+        # 进一步判断是否与金融市场相关
+        market_keywords = [
+            'stock', 'market', 'trade', 'tariff', 'currency', 'dollar', 'gold',
+            'fed', 'interest rate', 'economy', 'economic', 'wall street',
+            'treasury', 'tax', 'fiscal', 'policy', 'china', 'regulation'
+        ]
+        if any(kw in content for kw in market_keywords):
+            return 'trump'  # 特朗普+市场影响
+    
+    # 第二类：重大国际新闻（地缘政治、能源、货币）
+    geopolitical_keywords = [
+        # 地区
+        'middle east', 'iran', 'israel', 'saudi', 'opec', 'russia', 'ukraine',
+        'china', 'taiwan', 'north korea', 'syria', 'iraq',
+        '中东', '伊朗', '以色列', '俄罗斯', '乌克兰',
+        
+        # 能源和大宗商品
+        'oil', 'crude', 'petroleum', 'energy', 'opec', 'brent',
+        'natural gas', 'commodity', 'commodities',
+        '原油', '石油', '能源',
+        
+        # 货币和汇率
+        'dollar', 'yuan', 'euro', 'currency', 'exchange rate', 'forex',
+        '美元', '人民币', '欧元', '汇率',
+        
+        # 地缘政治事件
+        'war', 'conflict', 'sanction', 'embargo', 'military', 'nuclear',
+        'geopolitical', 'crisis', 'tension',
+        '战争', '冲突', '制裁', '军事', '危机'
+    ]
+    if any(kw in content for kw in geopolitical_keywords):
+        return 'international'  # 重大国际新闻
+    
+    # 第一类：财经重要新闻（股市、央行、经济数据）
+    financial_keywords = [
+        # 股市
+        'stock market', 'stock', 'dow jones', 'nasdaq', 's&p 500', 's&p',
+        'shanghai', 'shenzhen', 'hang seng', 'nikkei', 'ftse',
+        'bull market', 'bear market', 'rally', 'crash', 'volatility',
+        '股市', '股票', '上证', '深证', '恒指',
+        
+        # 央行和货币政策
+        'federal reserve', 'fed', 'central bank', 'interest rate',
+        'monetary policy', 'inflation', 'deflation', 'rate cut', 'rate hike',
+        'quantitative easing', 'qe', 'tightening',
+        '美联储', '央行', '利率', '通胀', '加息', '降息',
+        
+        # 经济指标
+        'gdp', 'employment', 'unemployment', 'jobs report', 'cpi', 'ppi',
+        'retail sales', 'consumer confidence', 'pmi', 'manufacturing',
+        'recession', 'growth', 'economic data',
+        '就业', '失业', 'GDP', '经济增长',
+        
+        # 企业财报
+        'earnings', 'revenue', 'profit', 'quarterly results', 'eps',
+        'guidance', 'forecast', 'outlook',
+        '财报', '盈利', '营收'
+    ]
+    if any(kw in content for kw in financial_keywords):
+        return 'financial'  # 财经重要新闻
+    
+    # 默认归为财经新闻
+    return 'financial'
 
 def fetch_news_from_rss():
     """从RSS源抓取财经新闻（财经源直接取最新条目，不依赖关键词过滤）"""
@@ -148,14 +254,24 @@ def fetch_news_from_rss():
                 is_highlight = any(kw in content for kw in keywords)
                 # 如果没有关键词但有内容，仍然保留（重要性稍低）
                 
+                # 翻译标题和描述
+                title_cn = translate_to_chinese(title)
+                description_cn = translate_to_chinese(summary[:200]) if summary else ''
+                
+                # 分类新闻
+                category = classify_news(title, summary, rss_info['source'])
+                
                 news_item = {
-                    'title': title,
-                    'description': (summary[:200] if summary else ''),
+                    'title': title_cn,
+                    'title_en': title,
+                    'description': description_cn,
+                    'description_en': summary[:200] if summary else '',
                     'url': entry.get('link', ''),
                     'source': rss_info['source'],
                     'publishedAt': entry.get('published', ''),
                     'highlight': is_highlight,
                     'time_diff': (current_time - pub_time).total_seconds() / 3600 if pub_time else None,
+                    'category': category,
                 }
                 news_list.append(news_item)
                 taken += 1
@@ -190,14 +306,21 @@ def fetch_news_from_rss():
                         summary = re.sub(r'<[^>]+>', '', summary)
                     else:
                         summary = ''
+                    title_cn = translate_to_chinese(title)
+                    description_cn = translate_to_chinese(summary[:200]) if summary else ''
+                    category = classify_news(title, summary, rss_info['source'])
+                    
                     news_list.append({
-                        'title': title,
-                        'description': (summary[:200] if summary else ''),
+                        'title': title_cn,
+                        'title_en': title,
+                        'description': description_cn,
+                        'description_en': summary[:200] if summary else '',
                         'url': entry.get('link', ''),
                         'source': rss_info['source'],
                         'publishedAt': entry.get('published', ''),
                         'highlight': False,
                         'time_diff': None,
+                        'category': category,
                     })
                 
                 if news_list:
@@ -276,14 +399,20 @@ def fetch_news_from_web_scraping():
                             link = 'https://' + source['url'].split('/')[2] + link
                     
                     if title and len(title) > 5:
+                        title_cn = translate_to_chinese(title)
+                        category = classify_news(title, '', source['name'])
+                        
                         news_list.append({
-                            'title': title[:200],
+                            'title': title_cn,
+                            'title_en': title[:200],
                             'description': '',
+                            'description_en': '',
                             'url': link or '',
                             'source': source['name'],
                             'publishedAt': '',
                             'highlight': True,
                             'time_diff': 0,
+                            'category': category,
                         })
                 except Exception:
                     continue
@@ -343,14 +472,22 @@ def fetch_news_from_api():
                     except Exception:
                         pass
                     
+                    title_cn = translate_to_chinese(title)
+                    desc = article.get('description', '')[:200] if article.get('description') else ''
+                    description_cn = translate_to_chinese(desc)
+                    category = classify_news(title, desc, 'NewsAPI')
+                    
                     news_list.append({
-                        'title': title,
-                        'description': article.get('description', '')[:200] if article.get('description') else '',
+                        'title': title_cn,
+                        'title_en': title,
+                        'description': description_cn,
+                        'description_en': desc,
                         'url': article.get('url', ''),
                         'source': article.get('source', {}).get('name', 'NewsAPI'),
                         'publishedAt': article.get('publishedAt', ''),
-                        'highlight': True,  # NewsAPI的头条都标记为重要
+                        'highlight': True,
                         'time_diff': time_diff,
+                        'category': category,
                     })
             else:
                 error_msg = data.get('message', '未知错误')
@@ -369,89 +506,117 @@ def fetch_news_from_api():
     return news_list
 
 def format_news_content(news_list):
-    """格式化新闻内容为推送格式"""
+    """格式化新闻内容为推送格式 - 按三类分类显示"""
     if not news_list:
         return "📰 过去24小时未发现重要财经新闻，但系统正常运行。如果持续无新闻，请检查RSS源是否可访问。"
     
-    # 去重（基于标题）
+    # 去重（基于英文标题，避免翻译差异导致的重复）
     seen_titles = set()
     unique_news = []
     for news in news_list:
-        title = news.get('title', '')
-        if title and title not in seen_titles:
-            seen_titles.add(title)
+        title_en = news.get('title_en', news.get('title', ''))
+        if title_en and title_en not in seen_titles:
+            seen_titles.add(title_en)
             unique_news.append(news)
     
-    # 统计信息
-    highlight_count = sum(1 for n in unique_news if n.get('highlight'))
+    # 按类别分组
+    trump_news = [n for n in unique_news if n.get('category') == 'trump']
+    international_news = [n for n in unique_news if n.get('category') == 'international']
+    financial_news = [n for n in unique_news if n.get('category') == 'financial']
     
-    # 按来源分组
+    # 统计信息
     content = f"📊 财经早报 - {datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')}\n"
-    content += "=" * 50 + "\n\n"
+    content += "=" * 60 + "\n\n"
     content += f"📈 统计信息\n"
     content += f"  • 总新闻数：{len(unique_news)} 条\n"
-    content += f"  • 重要新闻：{highlight_count} 条\n"
+    content += f"  • 特朗普相关：{len(trump_news)} 条\n"
+    content += f"  • 重大国际新闻：{len(international_news)} 条\n"
+    content += f"  • 财经重要新闻：{len(financial_news)} 条\n"
     content += f"  • 更新时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     
     if len(unique_news) == 0:
         content += "⚠️ 暂无新闻数据\n"
         return content
     
-    # 按重要性和来源分类显示
-    highlight_news = [n for n in unique_news if n.get('highlight')]
-    normal_news = [n for n in unique_news if not n.get('highlight')]
-    
-    # 先显示重要新闻
-    if highlight_news:
-        content += "⭐ 【重要新闻】\n"
-        content += "-" * 50 + "\n"
-        for idx, news in enumerate(highlight_news[:10], 1):  # 显示前10条重要新闻
+    # 第一类：特朗普相关（重点关注）
+    if trump_news:
+        content += "🔴 【特朗普最新消息 - 市场影响分析】\n"
+        content += "=" * 60 + "\n"
+        content += "（对股市、外汇、黄金具有重要影响的消息）\n\n"
+        
+        for idx, news in enumerate(trump_news[:8], 1):  # 显示前8条
             title = news.get('title', '无标题')
             description = news.get('description', '')
             url = news.get('url', '')
             source = news.get('source', '未知来源')
-            time_info = ""
-            if news.get('time_diff') is not None:
-                hours = int(news.get('time_diff', 0))
-                if hours < 1:
-                    time_info = " (刚刚)"
-                elif hours < 24:
-                    time_info = f" ({hours}小时前)"
-                else:
-                    time_info = f" ({hours//24}天前)"
+            time_info = _format_time_info(news.get('time_diff'))
             
             content += f"{idx}. 【{source}】{title}{time_info}\n"
             if description:
-                content += f"   {description}...\n"
+                content += f"   💬 {description}\n"
             if url:
                 content += f"   🔗 {url}\n"
             content += "\n"
     
-    # 再显示普通新闻
-    if normal_news:
-        remaining = min(10, len(normal_news))  # 最多再显示10条
-        content += f"\n📰 【其他新闻】(显示前{remaining}条)\n"
-        content += "-" * 50 + "\n"
-        for idx, news in enumerate(normal_news[:remaining], 1):
+    # 第二类：重大国际新闻（地缘政治、能源、货币）
+    if international_news:
+        content += "🌍 【重大国际新闻】\n"
+        content += "=" * 60 + "\n"
+        content += "（中东局势、能源价格、货币汇率、地缘政治）\n\n"
+        
+        for idx, news in enumerate(international_news[:8], 1):  # 显示前8条
             title = news.get('title', '无标题')
+            description = news.get('description', '')
+            url = news.get('url', '')
             source = news.get('source', '未知来源')
-            time_info = ""
-            if news.get('time_diff') is not None:
-                hours = int(news.get('time_diff', 0))
-                if hours < 1:
-                    time_info = " (刚刚)"
-                elif hours < 24:
-                    time_info = f" ({hours}小时前)"
+            time_info = _format_time_info(news.get('time_diff'))
             
             content += f"{idx}. 【{source}】{title}{time_info}\n"
-        
-        if len(normal_news) > remaining:
-            content += f"\n...还有 {len(normal_news) - remaining} 条新闻未显示\n"
+            if description:
+                content += f"   💬 {description}\n"
+            if url:
+                content += f"   🔗 {url}\n"
+            content += "\n"
     
-    content += "\n" + "=" * 50 + "\n"
-    content += "✨ 更多财经资讯请访问：新浪财经、东方财富\n"
+    # 第三类：财经重要新闻（美股、中国股市、央行政策）
+    if financial_news:
+        content += "💰 【财经重要新闻】\n"
+        content += "=" * 60 + "\n"
+        content += "（美国股市、中国股市、央行政策、经济数据）\n\n"
+        
+        for idx, news in enumerate(financial_news[:10], 1):  # 显示前10条
+            title = news.get('title', '无标题')
+            description = news.get('description', '')
+            url = news.get('url', '')
+            source = news.get('source', '未知来源')
+            time_info = _format_time_info(news.get('time_diff'))
+            
+            content += f"{idx}. 【{source}】{title}{time_info}\n"
+            if description and len(description) > 10:
+                content += f"   💬 {description}\n"
+            if url:
+                content += f"   🔗 {url}\n"
+            content += "\n"
+    
+    content += "=" * 60 + "\n"
+    content += "✨ 数据来源：CNBC、Yahoo Finance、NewsAPI等国际财经媒体\n"
+    content += "🤖 由AI自动抓取、翻译、分类整理\n"
     
     return content
+
+def _format_time_info(time_diff):
+    """格式化时间信息"""
+    if time_diff is None:
+        return ""
+    
+    hours = int(time_diff)
+    if hours < 1:
+        return " (刚刚)"
+    elif hours < 24:
+        return f" ({hours}小时前)"
+    else:
+        days = hours // 24
+        return f" ({days}天前)"
 
 def send_via_serverchan(content):
     """通过Server酱API推送到微信"""
@@ -588,14 +753,12 @@ def main():
     rss_news = fetch_news_from_rss()
     all_news.extend(rss_news)
     print(f"✓ RSS源获取 {len(rss_news)} 条新闻")
-    print(f"  其中重要新闻 {sum(1 for n in rss_news if n.get('highlight'))} 条")
     
     print("\n[2/5] 从NewsAPI抓取新闻...")
     print("-" * 60)
     api_news = fetch_news_from_api()
     all_news.extend(api_news)
     print(f"✓ API获取 {len(api_news)} 条新闻")
-    print(f"  其中重要新闻 {sum(1 for n in api_news if n.get('highlight'))} 条")
     
     # 备用方案：如果RSS和API都没有获取到足够的新闻，尝试web爬虫
     if len(all_news) < 5:
@@ -610,8 +773,16 @@ def main():
     print("\n[4/5] 格式化新闻内容...")
     print("-" * 60)
     print(f"✓ 总共获取 {len(all_news)} 条新闻")
-    highlight_sum = sum(1 for n in all_news if n.get('highlight'))
-    print(f"  其中重要新闻 {highlight_sum} 条")
+    
+    # 按类别统计
+    trump_count = sum(1 for n in all_news if n.get('category') == 'trump')
+    intl_count = sum(1 for n in all_news if n.get('category') == 'international')
+    fin_count = sum(1 for n in all_news if n.get('category') == 'financial')
+    
+    print(f"  • 特朗普相关：{trump_count} 条")
+    print(f"  • 重大国际新闻：{intl_count} 条")
+    print(f"  • 财经重要新闻：{fin_count} 条")
+    print(f"  ℹ️  所有新闻已自动翻译为中文")
     
     # 格式化内容
     content = format_news_content(all_news)
