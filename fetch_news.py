@@ -298,52 +298,73 @@ def fetch_news_from_web_scraping():
     return news_list
 
 def fetch_news_from_api():
-    """从NewsAPI抓取新闻（需要API密钥）"""
+    """从NewsAPI抓取新闻（需要API密钥）- 参考 https://newsapi.org/ 官方文档"""
     news_list = []
     api_key = os.getenv('NEWS_API_KEY', '')
     
     if not api_key:
-        print("未配置NEWS_API_KEY，跳过API新闻源")
+        print("  ⚠️ 未配置NEWS_API_KEY，跳过API新闻源")
+        print("  获取API密钥：https://newsapi.org/register")
         return news_list
     
-    keywords = [
-        'Federal Reserve',  # 美联储
-        'US President',     # 美国总统
-        'interest rate',     # 利率
-        'inflation',         # 通胀
-        'stock market',      # 股市
-        'exchange rate',     # 汇率
-        'central bank',      # 央行
-        'monetary policy'    # 货币政策
-    ]
-    
     try:
-        for keyword in keywords:
-            url = "https://newsapi.org/v2/everything"
-            params = {
-                'q': keyword,
-                'sortBy': 'publishedAt',
-                'language': 'en',
-                'apiKey': api_key,
-                'from': (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%S'),
-                'pageSize': 5
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                articles = response.json().get('articles', [])
+        print("  正在从NewsAPI获取财经新闻...")
+        
+        # 使用 top-headlines 端点获取头条新闻（更适合财经早报）
+        url = "https://newsapi.org/v2/top-headlines"
+        params = {
+            'apiKey': api_key,
+            'category': 'business',  # 商业/财经类别
+            'language': 'en',        # 英文新闻
+            'pageSize': 20           # 获取20条
+        }
+        
+        response = requests.get(url, params=params, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'ok':
+                articles = data.get('articles', [])
+                print(f"  ✓ NewsAPI返回 {len(articles)} 条新闻")
+                
                 for article in articles:
+                    title = article.get('title', '')
+                    if not title or title == '[Removed]':
+                        continue
+                    
+                    # 计算发布时间差
+                    pub_time = None
+                    time_diff = None
+                    try:
+                        pub_str = article.get('publishedAt', '')
+                        if pub_str:
+                            pub_time = datetime.strptime(pub_str, '%Y-%m-%dT%H:%M:%SZ')
+                            time_diff = (datetime.now() - pub_time).total_seconds() / 3600
+                    except Exception:
+                        pass
+                    
                     news_list.append({
-                        'title': article.get('title', ''),
+                        'title': title,
                         'description': article.get('description', '')[:200] if article.get('description') else '',
                         'url': article.get('url', ''),
                         'source': article.get('source', {}).get('name', 'NewsAPI'),
-                        'publishedAt': article.get('publishedAt', '')
+                        'publishedAt': article.get('publishedAt', ''),
+                        'highlight': True,  # NewsAPI的头条都标记为重要
+                        'time_diff': time_diff,
                     })
+            else:
+                error_msg = data.get('message', '未知错误')
+                print(f"  ✗ NewsAPI错误: {error_msg}")
+        elif response.status_code == 401:
+            print(f"  ✗ NewsAPI认证失败 - API密钥无效")
+            print(f"  请检查NEWS_API_KEY是否正确")
+        elif response.status_code == 429:
+            print(f"  ✗ NewsAPI请求限制 - 已超过免费配额")
+        else:
+            print(f"  ✗ NewsAPI返回错误: {response.status_code}")
             
-            time.sleep(1)  # 避免请求过快
     except Exception as e:
-        print(f"API抓取失败: {e}")
+        print(f"  ✗ NewsAPI抓取异常: {str(e)[:50]}...")
     
     return news_list
 
